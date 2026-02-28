@@ -151,4 +151,9 @@ consistent with the theoretical design of protective puts and collars.
 
 ## 9. Summary and Conclusions
 
-Across all sheets, the evidence supports the central thesis that systematic option overlays can improve risk-adjusted performance and tail protection relative to a buy-and-hold equity benchmark. The collar strategy, in particular, delivers the highest Sharpe ratio and smallest maximum drawdown while achieving the highest full-sample CAGR, driven by net premium income and reduced volatility. The protective put improves drawdown and risk-adjusted returns but at a modest cost to total return. Both overlays reshape the return distribution, reducing negative skewness and excess kurtosis. Regime and crisis analyses show that overlays are most valuable in bear markets while remaining competitive in bull markets. The results are consistent with the theoretical framework and payoff structures described in Chapter 5, and they provide empirical support for the dissertation’s research question.
+Across all sheets, the evidence supports the central thesis that systematic option overlays can improve risk-adjusted performance and tail protection relative 
+to a buy-and-hold equity benchmark. The collar strategy, in particular, delivers the highest Sharpe ratio and smallest maximum drawdown while achieving the highest
+full-sample CAGR, driven by net premium income and reduced volatility. The protective put improves drawdown and risk-adjusted returns but at a modest cost to total return. 
+Both overlays reshape the return distribution, reducing negative skewness and excess kurtosis. Regime and crisis analyses show that overlays are most valuable in bear markets
+while remaining competitive in bull markets. The results are consistent with the theoretical framework and payoff structures described in Chapter 5, and they provide empirical
+support for the dissertation’s research question.
