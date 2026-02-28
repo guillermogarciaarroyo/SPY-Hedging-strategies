@@ -16,7 +16,6 @@ Long SPY, long the same 90–95% put (≈ −0.20 / −0.30 delta), and short a 
 The call has the same expiry, with strike 105–110% of spot, i.e. roughly +0.20 to +0.30 delta.
 Objective: use the call premium to partially finance the put, reducing hedge cost, in exchange for capping upside beyond ~5–10% gains above the entry level.
 
-# will later update with more cross assets: Gold, VIX, XOVER, EUROSTOXX, ETFS and indexes...
-
-   this code will download graphic representations and an excel summary of all the results
-   backtest goes from 2019 to 2025, needs iVolatility account to scrape the data
+will later update with more cross assets: Gold, VIX, XOVER, EUROSTOXX, ETFS and indexes...
+this code will download graphic representations and an excel summary of all the results
+backtest goes from 2019 to 2025, needs iVolatility account to scrape the data
