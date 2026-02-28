@@ -1,0 +1,154 @@
+# Dissertation Mode: Analysis of Backtest Results
+
+**Systematic Option Overlay Strategies on SPY: Performance, Risk, and Tail Protection Analysis (2019–2025)**
+
+---
+
+## 1. Quarterly Returns and Cumulative Performance
+
+The *Quarterly_Returns* sheet reports the quarterly simple returns and cumulative wealth
+(normalised to 1.0 at inception) for the benchmark (buy-and-hold SPY), the protective put overlay (SPY+Put),
+and the collar overlay (SPY+Collar) over the sample period from January 2019 to October 2025. The strategies are rebalanced on the first trading day of each quarter.
+
+**Findings:** The collar strategy achieves the highest end-of-sample cumulative wealth (2.91× initial capital) 
+relative to SPY+Put (2.22×) and SPY (2.23×). This reflects the collar’s combination of downside protection and 
+net premium income from selling the call. The protective put underperforms the benchmark on a total-return basis 
+due to the recurring cost of put premiums. During the two major drawdowns—the COVID-19 crash (Q1 2020) and the 2022 bear 
+market—both overlays materially dampened losses: in Q1 2020, SPY returned −18.1%, SPY+Put −7.2%, and SPY+Collar −3.9%; 
+in Q2 2022, SPY −14.1%, SPY+Put −7.5%, and SPY+Collar −5.4%. In strong bull quarters (e.g. Q2 2020), the collar’s short call cap limits upside, 
+resulting in lower returns than SPY and SPY+Put.
+
+**Relation to thesis:** The quarterly return series demonstrates that option overlays change the return distribution of 
+the equity portfolio: they reduce tail losses in stress quarters and, in the collar case, can improve long-run risk-adjusted 
+performance when net premium income and reduced volatility offset forgone upside.
+
+---
+
+## 2. Full-Sample Performance Metrics
+
+The *Performance* sheet reports annualised metrics for the full sample: compound annual growth rate (CAGR), annualised volatility, Sharpe ratio, and maximum drawdown.
+
+| Strategy   | CAGR  | Vol   | Sharpe | MaxDD   |
+|-----------|-------|-------|--------|---------|
+| SPY       | 12.15%| 15.82%| 0.81   | −21.80% |
+| SPY+Put   | 12.05%| 12.00%| 1.02   | −17.51% |
+| SPY+Collar| 16.46%|  9.94%| 1.61   | −11.57% |
+
+**Findings:** The collar strategy delivers the highest CAGR (16.46%), the lowest volatility (9.94%), and the highest Sharpe ratio (1.61). 
+It also exhibits the smallest maximum drawdown (−11.57%), versus −21.80% for SPY and −17.51% for SPY+Put. The protective put improves risk-adjusted 
+performance (higher Sharpe, lower MaxDD) relative to SPY but at a slightly lower CAGR, consistent with paying put premiums. 
+The collar’s superior results reflect net premium income from the short call, which partially funds the put and reduces volatility by capping upside.
+
+**Relation to thesis:** These results support the thesis that systematic option overlays can improve long-run risk-adjusted performance. 
+The collar, in particular, shows that financing the put via a short call can improve both return and risk metrics under the assumptions of this backtest.
+
+---
+
+## 3. Distributional Statistics (Skewness and Kurtosis)
+
+The *Distribution_Stats* sheet reports the mean, standard deviation, skewness, and excess kurtosis of quarterly returns for each strategy.
+
+| Strategy   | Mean_Q | Std_Q | Skew_Q  | Kurtosis_Excess_Q |
+|-----------|--------|-------|---------|-------------------|
+| SPY       | 3.21%  | 7.91% | −0.50   | 2.38              |
+| SPY+Put   | 3.05%  | 6.00% | +0.27   | 0.67              |
+| SPY+Collar| 4.00%  | 4.97% | −0.27   | −0.74             |
+
+**Findings:** SPY exhibits negative skewness (−0.50) and positive excess kurtosis (2.38), consistent with fat tails and downside asymmetry. 
+The protective put reduces left-tail risk: skewness moves from negative to positive (+0.27) and excess kurtosis drops to 0.67.
+The collar further reduces volatility (Std_Q falls to 4.97%) and excess kurtosis (−0.74), indicating a more symmetric and less fat-tailed distribution. 
+Both overlays reshape the return distribution in the direction intended by tail-risk hedging.
+
+**Relation to thesis:** These results align with Chapter 2’s emphasis on non-normality and fat tails. 
+The overlays reduce skewness and kurtosis in a manner consistent with truncating the left tail and limiting the right tail, 
+supporting the hypothesis that option overlays can mitigate distributional asymmetries.
+
+---
+
+## 4. Regime-Specific Performance
+
+The *Regime_Performance* sheet breaks down performance across four economic regimes: Late-cycle (2019), COVID and QE (2020–2021), Tightening (2022–2023), and Recent (2024–2025).
+
+**Findings:**
+
+- **Late-cycle 2019:** The collar achieves the highest CAGR (34.74%) and Sharpe (3.60), with zero drawdown. 
+SPY and SPY+Put also perform strongly (CAGRs 24–25%, Sharpes ~2.1).
+
+- **COVID and QE 2020–2021:** The collar again leads on CAGR (26.68%) and Sharpe (2.42). 
+The protective put outperforms SPY on risk-adjusted metrics (Sharpe 1.38 vs 0.89) and delivers a smaller drawdown. Volatility is highest for SPY (23.2%).
+
+- **Tightening 2022–2023:** This regime is the most challenging for equity. SPY has a negative CAGR (−1.65%) and a large drawdown (−17.9%). 
+The protective put reduces the drawdown to −12.7%, while the collar limits it to −8.1% and maintains a positive CAGR (4.66%) and positive Sharpe (0.47).
+
+- **Recent 2024–2025:** All strategies are profitable. The collar delivers the highest Sharpe (1.91) and the smallest drawdown (−2.5%). 
+SPY has the highest CAGR (13.9%) but also the largest drawdown (−2.4%).
+
+**Relation to thesis:** Regime analysis shows that overlays are most valuable in bear regimes (2022–2023) while still improving risk-adjusted performance in bull regimes. 
+This supports the thesis that systematic overlays can improve resilience across different market conditions.
+
+---
+
+## 5. Crisis Window Performance
+
+The *Crisis_Windows* sheet evaluates performance during the two major peak-to-trough drawdowns identified from the quarterly SPY equity curve: DD1 (2019-Q4 to 2020-Q1, COVID crash) 
+and DD2 (2021-Q4 to 2022-Q3, 2022 bear market).
+
+**Findings:**
+
+- **DD1 (COVID crash):** SPY cumulative return −11.7%, max drawdown −18.1%. The protective put limits the loss to −0.2% cumulative return and −7.2% max drawdown. 
+The collar achieves a *positive* cumulative return (+5.6%) and a max drawdown of only −3.9%, reflecting the combination of put protection and call premium income.
+
+- **DD2 (2022 bear market):** SPY cumulative return −15.6%, max drawdown −21.8%. The protective put limits the loss to −11.8% cumulative return and −17.5% max drawdown. 
+The collar limits the loss to −5.0% cumulative return and −11.6% max drawdown.
+
+**Relation to thesis:** Crisis analysis directly supports the thesis’s focus on tail protection. 
+Both overlays materially reduce losses during peak-to-trough episodes; the collar provides the strongest protection, consistent with the payoff structure and net premium received.
+
+---
+
+## 6. Allocation: SPY vs Derivatives
+
+The *Allocation_SPY_vs_Deriv* sheet reports, for each quarter, the share of initial capital allocated to SPY equity (Equity_Pct), 
+the put premium as a share of capital (Put_Cost_Pct), and the net option premium for the collar (Collar_Net_Pct, negative when the call premium exceeds the put premium).
+
+**Findings:** Equity allocation typically ranges from ~51% to ~94% of capital, depending on option costs and slippage. 
+Put cost is usually small (0.2%–4.3% of capital), with a spike in Q2 2020 reflecting higher implied volatility. 
+Collar net is often negative (net credit), indicating that the call premium received typically exceeds the put premium paid; in some later quarters it turns slightly positive. 
+The modest size of derivative overlays relative to equity confirms that the strategies are primarily equity with a small option overlay, as intended.
+
+**Relation to thesis:** The allocation table documents that overlays are implemented with realistic capital constraints and that the collar is often net credit, 
+which helps explain its favourable performance and lower volatility.
+
+---
+
+## 7. Derivative Payoffs at Expiry
+
+The *Derivative_Payoffs* sheet shows the payoff at expiry for the put and short call across different terminal SPY levels (moneyness from 80% to 115%), 
+assuming put strike at 92.5% and call strike at 107.5% of spot.
+
+**Findings:** Below 92.5% moneyness, the put pays off (e.g. 50 at 80%, 30 at 85%, 10 at 90%); above 92.5% it expires worthless. 
+Above 107.5% moneyness, the short call loses value (e.g. −10 at 110%, −30 at 115%). The collar net payoff is positive when SPY is below the put strike and negative 
+when SPY is above the call strike, illustrating the floor and cap of the strategy.
+
+**Relation to thesis:** The payoff table formalises the convex protection and upside cap described in Chapter 5 and makes the mechanism behind drawdown reduction and return smoothing explicit.
+
+---
+
+## 8. Worst and Best SPY Quarters
+
+The *Worst_SPY_Quarters* and *Best_SPY_Quarters* sheets list the five worst and five best quarters for SPY and the corresponding returns for each strategy.
+
+**Worst quarters:** Q1 2020 (COVID) is the worst for SPY (−18.1%); overlays reduce the loss to −7.2% (put) and −3.9% (collar). 
+The four other worst quarters (2022 Q1, Q2, Q3 and 2023 Q3) also show consistent overlay protection: SPY+Collar consistently experiences the smallest losses.
+
+**Best quarters:** Q2 2020 (COVID rebound) is the best for SPY (+23.3%); the collar captures less upside (+11.2%) due to the short call cap. 
+In other strong quarters (2019 Q1, 2020 Q4, 2024 Q1, 2023 Q4), the collar often underperforms SPY and SPY+Put, illustrating the trade-off between protection and upside participation.
+
+**Relation to thesis:** These tables illustrate the asymmetric payoff of the overlays: they attenuate losses in bad quarters and limit gains in strong bull quarters, 
+consistent with the theoretical design of protective puts and collars.
+
+---
+
+## 9. Summary and Conclusions
+
+Across all sheets, the evidence supports the central thesis that systematic option overlays can improve risk-adjusted performance and tail protection relative to a buy-and-hold equity benchmark. The collar strategy, in particular, delivers the highest Sharpe ratio and smallest maximum drawdown while achieving the highest full-sample CAGR, driven by net premium income and reduced volatility. The protective put improves drawdown and risk-adjusted returns but at a modest cost to total return. Both overlays reshape the return distribution, reducing negative skewness and excess kurtosis. Regime and crisis analyses show that overlays are most valuable in bear markets while remaining competitive in bull markets. The results are consistent with the theoretical framework and payoff structures described in Chapter 5, and they provide empirical support for the dissertation’s research question.
