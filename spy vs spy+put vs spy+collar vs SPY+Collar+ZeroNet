@@ -1,0 +1,1034 @@
+import os
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from scipy.stats import norm
+import time
+
+# =====================================
+# CONFIG
+# =====================================
+
+API_KEY = os.environ.get("IVOLATILITY_API_KEY", "E7RncSa8vbK8Eyat")
+START_DATE = "2019-01-01"  # Options data available from 2019; analysis focused on drawdowns since then
+END_DATE   = "2025-12-31"
+
+INITIAL_CAPITAL = 1_000_000  # 1 mn € (or USD)
+CONTRACT_SIZE = 100
+
+OUTPUT_FILE = "SPY_OVERLAY_FULL_REPORT.xlsx"
+
+# --- 4th strategy: zero-net-premium collar (same put as baseline) ---
+# Short call strike on the same expiry: minimise |Put Ask$ − Call Bid$| per contract
+# over calls in [ZERO_CALL_MNY_MIN, ZERO_CALL_MNY_MAX] with Call Bid > 0.
+# Commission is separate; "zero" is upfront option premium net at NBBO ask/bid.
+ZERO_CALL_MNY_MIN = 1.02
+ZERO_CALL_MNY_MAX = 1.18
+
+# Transaction cost assumptions (tune for sensitivity analysis)
+STOCK_SLIPPAGE_BPS = 0.001        # 10 bps one-way slippage on SPY (set 0.0 to disable)
+OPTION_COMMISSION_PER_CONTRACT = 0.65  # USD per option contract (approx. round-trip charged at entry)
+
+# =====================================
+# SESSION WITH RETRY
+# =====================================
+
+session = requests.Session()
+retry = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# =====================================
+# DOWNLOAD SPY
+# =====================================
+
+print("Downloading SPY...")
+spy = yf.download("SPY", start=START_DATE, end=END_DATE, progress=False)
+
+if isinstance(spy.columns, pd.MultiIndex):
+    spy.columns = spy.columns.get_level_values(0)
+
+spy = spy.dropna().sort_index()
+
+# Quarterly roll dates: first trading day of each quarter
+roll_dates = (
+    spy.groupby(spy.index.to_period("Q"))
+       .apply(lambda x: x.index[0])
+       .sort_values()
+       .to_list()
+)
+
+print("Total roll dates:", len(roll_dates))
+
+def get_spot_on_or_before(date):
+    """
+    Get SPY close on or BEFORE the given date.
+    This avoids using a Monday price for a Saturday expiration.
+    """
+    data = spy.loc[spy.index <= date]
+    if data.empty:
+        return None
+    return float(data.iloc[-1]["Close"])
+
+# =====================================
+# OPTION FETCH
+# =====================================
+
+def get_option_chain(trade_date, cp, dte_from=80, dte_to=100, delta_from=None, delta_to=None):
+    """
+    Fetch SPY options for a DTE window. Default deltas match the baseline collar selection.
+    cp = "P" for puts, "C" for calls.
+    """
+    url = "https://restapi.ivolatility.com/equities/eod/stock-opts-by-param"
+
+    if delta_from is None or delta_to is None:
+        if cp == "P":
+            delta_from, delta_to = -0.60, -0.05
+        else:
+            delta_from, delta_to = 0.05, 0.60
+
+    params = {
+        "apiKey": API_KEY,
+        "symbol": "SPY",
+        "dteFrom": dte_from,
+        "dteTo": dte_to,
+        "cp": cp,
+        "tradeDate": trade_date.strftime("%Y-%m-%d"),
+        "deltaFrom": delta_from,
+        "deltaTo": delta_to,
+        "region": "USA"
+    }
+
+    try:
+        r = session.get(url, params=params, timeout=(5, 15))
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+
+    if "data" not in data or len(data["data"]) == 0:
+        return None
+
+    df = pd.DataFrame(data["data"])
+
+    required = ["expiration_date", "Bid", "Ask", "price_strike"]
+    if not all(col in df.columns for col in required):
+        return None
+
+    df = df.dropna(subset=required).copy()
+    df["expiration_date"] = pd.to_datetime(df["expiration_date"])
+
+    for col in ["Bid", "Ask", "price_strike"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Bid", "Ask", "price_strike"])
+
+    if df.empty:
+        return None
+
+    return df
+
+
+# =====================================
+# BACKTEST
+# =====================================
+
+spy_returns = []
+put_returns = []
+collar_returns = []
+collar_zn_returns = []
+dates = []
+alloc_equity_pct = []
+alloc_put_pct = []
+alloc_collar_net_pct = []
+alloc_collar_zn_net_pct = []
+zn_net_pre_comm_usd = []  # Put Ask$ − Call Bid$ at chosen strike (per contract)
+zn_net_incl_comm_usd = []
+zn_call_moneyness_hist = []
+static_call_moneyness_hist = []
+
+for start in roll_dates:
+
+    spot_start = get_spot_on_or_before(start)
+    if spot_start is None:
+        continue
+
+    puts = get_option_chain(start, "P")
+    calls_chain = get_option_chain(start, "C")
+
+    if puts is None or calls_chain is None:
+        continue
+
+    # -------- SELECT PUT (90–95% moneyness, target ~92.5%) --------
+    puts["moneyness"] = puts["price_strike"] / spot_start
+    puts = puts[(puts["moneyness"] >= 0.90) & (puts["moneyness"] <= 0.95)]
+    if puts.empty:
+        continue
+
+    puts["target_diff"] = (puts["moneyness"] - 0.925).abs()
+    put = puts.sort_values("target_diff").iloc[0]
+
+    expiration = put["expiration_date"]
+    spot_exp = get_spot_on_or_before(expiration)
+    if spot_exp is None:
+        continue
+
+    strike_put = float(put["price_strike"])
+    put_ask = float(put["Ask"])
+    put_cost = put_ask * CONTRACT_SIZE  # per contract (executed long put at ask)
+
+    calls_exp = calls_chain[calls_chain["expiration_date"] == expiration].copy()
+    if calls_exp.empty:
+        continue
+
+    # -------- STATIC COLLAR: call 105–110% moneyness, target ~107.5% --------
+    calls_band = calls_exp.copy()
+    calls_band["moneyness"] = calls_band["price_strike"] / spot_start
+    calls_band = calls_band[
+        (calls_band["moneyness"] >= 1.05) & (calls_band["moneyness"] <= 1.10)
+    ]
+    if calls_band.empty:
+        continue
+
+    calls_band["target_diff"] = (calls_band["moneyness"] - 1.075).abs()
+    call = calls_band.sort_values("target_diff").iloc[0]
+
+    strike_call = float(call["price_strike"])
+    call_premium = float(call["Bid"]) * CONTRACT_SIZE  # per contract
+    static_call_mny = float(call["price_strike"]) / spot_start
+
+    # -------- ZERO-NET COLLAR: minimise |Put Ask$ − Call Bid$| (NBBO cash at entry)
+    zn = calls_exp.copy()
+    zn["moneyness"] = zn["price_strike"] / spot_start
+    zn = zn[
+        (zn["moneyness"] >= ZERO_CALL_MNY_MIN)
+        & (zn["moneyness"] <= ZERO_CALL_MNY_MAX)
+        & (zn["Bid"] > 0)
+    ]
+    if zn.empty:
+        continue
+
+    zn["net_pre_comm"] = put_cost - zn["Bid"] * CONTRACT_SIZE
+    zn["abs_net"] = zn["net_pre_comm"].abs()
+    zn = zn.sort_values(["abs_net", "moneyness"], ascending=[True, True])
+    call_zn = zn.iloc[0]
+
+    strike_call_zn = float(call_zn["price_strike"])
+    call_premium_zn = float(call_zn["Bid"]) * CONTRACT_SIZE
+    zn_call_mny = strike_call_zn / spot_start
+    zn_pre = float(call_zn["net_pre_comm"])
+    zn_incl_comm = zn_pre + OPTION_COMMISSION_PER_CONTRACT
+
+    # =============================================
+    # CAPITAL ALLOCATION (per-contract sizing with costs)
+    # =============================================
+
+    # Stock cost per contract including slippage
+    stock_cost_per_contract = spot_start * CONTRACT_SIZE * (1.0 + STOCK_SLIPPAGE_BPS)
+
+    # Overlay costs per contract (option premium + commission)
+    put_overlay_per_contract = put_cost + OPTION_COMMISSION_PER_CONTRACT
+    collar_overlay_per_contract = put_cost - call_premium + OPTION_COMMISSION_PER_CONTRACT
+    collar_zn_overlay_per_contract = put_cost - call_premium_zn + OPTION_COMMISSION_PER_CONTRACT
+
+    # Cost per collar and per protective put (per contract)
+    cost_per_contract_put = stock_cost_per_contract + put_overlay_per_contract
+    cost_per_contract_collar = stock_cost_per_contract + collar_overlay_per_contract
+    cost_per_contract_collar_zn = stock_cost_per_contract + collar_zn_overlay_per_contract
+
+    # Size so SPY, put, static collar, and zero-net collar all fit on initial capital
+    cost_per_contract = max(
+        cost_per_contract_put,
+        cost_per_contract_collar,
+        cost_per_contract_collar_zn,
+    )
+
+    contracts = int(INITIAL_CAPITAL // cost_per_contract)
+    if contracts == 0:
+        continue
+
+    shares = contracts * CONTRACT_SIZE
+
+    # Total stock cost including slippage
+    total_stock_cost = shares * spot_start * (1.0 + STOCK_SLIPPAGE_BPS)
+
+    # Total overlay costs
+    total_put_overlay_cost = contracts * put_overlay_per_contract
+    total_collar_overlay_cost = contracts * collar_overlay_per_contract
+    total_collar_zn_overlay_cost = contracts * collar_zn_overlay_per_contract
+
+    # Cash for each strategy after paying all entry costs
+    cash_spy = INITIAL_CAPITAL - total_stock_cost
+    cash_put = INITIAL_CAPITAL - (total_stock_cost + total_put_overlay_cost)
+    cash_collar = INITIAL_CAPITAL - (total_stock_cost + total_collar_overlay_cost)
+    cash_collar_zn = INITIAL_CAPITAL - (total_stock_cost + total_collar_zn_overlay_cost)
+
+    # =============================================
+    # PAYOFFS AT EXPIRATION
+    # =============================================
+
+    equity_value = shares * spot_exp
+
+    # SPY
+    final_spy = equity_value + cash_spy
+    spy_ret = final_spy / INITIAL_CAPITAL - 1.0
+
+    # PROTECTIVE PUT
+    put_payoff = contracts * max(strike_put - spot_exp, 0.0) * CONTRACT_SIZE
+    final_put = equity_value + put_payoff + cash_put
+    put_ret = final_put / INITIAL_CAPITAL - 1.0
+
+    # COLLAR
+    call_payoff = contracts * max(spot_exp - strike_call, 0.0) * CONTRACT_SIZE
+    final_collar = equity_value + put_payoff - call_payoff + cash_collar
+    collar_ret = final_collar / INITIAL_CAPITAL - 1.0
+
+    # ZERO-NET COLLAR (4th strategy): same put; short call chosen for ~$0 premium net
+    call_payoff_zn = contracts * max(spot_exp - strike_call_zn, 0.0) * CONTRACT_SIZE
+    final_collar_zn = equity_value + put_payoff - call_payoff_zn + cash_collar_zn
+    collar_zn_ret = final_collar_zn / INITIAL_CAPITAL - 1.0
+
+    spy_returns.append(spy_ret)
+    put_returns.append(put_ret)
+    collar_returns.append(collar_ret)
+    collar_zn_returns.append(collar_zn_ret)
+    dates.append(start)
+
+    # Allocation: equity vs derivatives as % of initial capital
+    alloc_equity_pct.append((shares * spot_start) / INITIAL_CAPITAL)
+    alloc_put_pct.append((put_cost * contracts) / INITIAL_CAPITAL)
+    alloc_collar_net_pct.append((put_cost - call_premium) * contracts / INITIAL_CAPITAL)
+    alloc_collar_zn_net_pct.append((put_cost - call_premium_zn) * contracts / INITIAL_CAPITAL)
+    zn_net_pre_comm_usd.append(zn_pre)
+    zn_net_incl_comm_usd.append(zn_incl_comm)
+    zn_call_moneyness_hist.append(zn_call_mny)
+    static_call_moneyness_hist.append(static_call_mny)
+
+    time.sleep(0.5)
+
+# =====================================
+# DATAFRAME
+# =====================================
+
+df = pd.DataFrame({
+    "Start": dates,
+    "SPY": spy_returns,
+    "SPY+Put": put_returns,
+    "SPY+Collar": collar_returns,
+    "SPY+Collar+ZeroNet": collar_zn_returns,
+})
+
+# Cumulative wealth starting at 1.0: V_0 = 1, V_t = V_{t-1} * (1 + r_t)
+df["SPY_Cum"] = (1.0 + df["SPY"]).cumprod()
+df["SPY+Put_Cum"] = (1.0 + df["SPY+Put"]).cumprod()
+df["SPY+Collar_Cum"] = (1.0 + df["SPY+Collar"]).cumprod()
+df["SPY+Collar+ZeroNet_Cum"] = (1.0 + df["SPY+Collar+ZeroNet"]).cumprod()
+
+# Zero-net collar: premium, commission, allocation & carry (Excel + plots only; not on Quarterly_Returns)
+collar_zn_net_usd_quarter = [p * INITIAL_CAPITAL for p in alloc_collar_zn_net_pct]
+zn_analysis_df = pd.DataFrame(
+    {
+        "Start": dates,
+        "ZN_net_premium_pre_comm_USD": zn_net_pre_comm_usd,
+        "ZN_net_incl_comm_USD": zn_net_incl_comm_usd,
+        "Static_collar_call_moneyness": static_call_moneyness_hist,
+        "ZN_call_moneyness": zn_call_moneyness_hist,
+        "Excess_q_vs_static_collar_pp": (
+            (df["SPY+Collar+ZeroNet"] - df["SPY+Collar"]) * 100.0
+        ),
+        "Collar_ZeroNet_Net_Pct_capital": alloc_collar_zn_net_pct,
+        "Collar_ZeroNet_Net_USD_quarter": collar_zn_net_usd_quarter,
+        "Cum_Collar_ZeroNet_Net_USD": np.cumsum(collar_zn_net_usd_quarter),
+    }
+)
+
+# =====================================
+# PERFORMANCE METRICS
+# =====================================
+
+def performance_stats(returns, rf_quarterly=None):
+    returns = np.array(returns, dtype=float)
+
+    if len(returns) == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    rf = np.asarray(rf_quarterly, dtype=float) if rf_quarterly is not None else np.zeros_like(returns)
+    if len(rf) != len(returns):
+        rf = np.zeros_like(returns)
+
+    # CAGR: (V_final / V_initial)^(1/T) - 1 with V_initial = 1, V_final = prod(1+r), T = years
+    n_quarters = len(returns)
+    n_years = n_quarters / 4.0
+    cumulative = np.prod(1.0 + returns)  # wealth multiple from 1.0
+
+    cagr = cumulative ** (1.0 / n_years) - 1.0 if cumulative > 0 and n_years > 0 else np.nan
+
+    mean_q = np.mean(returns)
+    excess = returns - rf
+    mean_excess = np.mean(excess)
+    vol_excess = np.std(excess, ddof=1) if len(excess) > 1 else np.nan
+    vol_q = np.std(returns, ddof=1) if len(returns) > 1 else np.nan
+    vol_ann = vol_q * np.sqrt(4.0) if not np.isnan(vol_q) else np.nan
+
+    # Sharpe = mean(return) / vol(return) annualised when rf_quarterly is None (no risk-free adjustment)
+    sharpe = (mean_excess / vol_excess) * np.sqrt(4.0) if vol_excess not in (0, np.nan) else np.nan
+
+    curve = np.cumprod(1.0 + returns)
+    peak = np.maximum.accumulate(curve)
+    drawdown = (curve - peak) / peak
+    max_dd = float(drawdown.min())
+
+    return round(cagr, 4), round(vol_ann, 4), round(sharpe, 3), round(max_dd, 4)
+
+stats = pd.DataFrame(
+    [
+        performance_stats(df["SPY"], None),
+        performance_stats(df["SPY+Put"], None),
+        performance_stats(df["SPY+Collar"], None),
+        performance_stats(df["SPY+Collar+ZeroNet"], None),
+    ],
+    columns=["CAGR", "Vol", "Sharpe", "MaxDD"],
+    index=["SPY", "SPY+Put", "SPY+Collar", "SPY+Collar+ZeroNet"],
+)
+
+# Additional distribution statistics (skewness, kurtosis)
+dist_rows = []
+for col in ["SPY", "SPY+Put", "SPY+Collar", "SPY+Collar+ZeroNet"]:
+    series = df[col].dropna()
+    dist_rows.append(
+        {
+            "Strategy": col,
+            "Mean_Q": series.mean(),
+            "Std_Q": series.std(ddof=1),
+            "Skew_Q": series.skew(),
+            "Kurtosis_Excess_Q": series.kurt(),  # pandas returns excess kurtosis by default
+        }
+    )
+
+dist_stats_df = pd.DataFrame(dist_rows)
+
+# =====================================
+# REGIME / SUBPERIOD ANALYSIS (from 2019 onwards)
+# =====================================
+
+regimes = [
+    ("Late-cycle_2019", "2019-01-01", "2019-12-31"),
+    ("COVID_and_QE_2020_2021", "2020-01-01", "2021-12-31"),
+    ("Tightening_2022_2023", "2022-01-01", "2023-12-31"),
+    ("Recent_2024_2025", "2024-01-01", "2025-12-31"),
+]
+
+regime_rows = []
+
+for regime_name, start_date, end_date in regimes:
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date)
+    mask = (df["Start"] >= start_ts) & (df["Start"] <= end_ts)
+    sub = df.loc[mask]
+
+    if sub.empty:
+        continue
+
+    for col, strat_name in [
+        ("SPY", "SPY"),
+        ("SPY+Put", "SPY+Put"),
+        ("SPY+Collar", "SPY+Collar"),
+        ("SPY+Collar+ZeroNet", "SPY+Collar+ZeroNet"),
+    ]:
+        cagr, vol, sharpe, max_dd = performance_stats(sub[col], None)
+        regime_rows.append(
+            {
+                "Regime": regime_name,
+                "Strategy": strat_name,
+                "CAGR": cagr,
+                "Vol": vol,
+                "Sharpe": sharpe,
+                "MaxDD": max_dd,
+                "N_Quarters": len(sub),
+            }
+        )
+
+regime_stats_df = pd.DataFrame(regime_rows)
+
+# =====================================
+# CRISIS WINDOW ANALYSIS (peak-to-trough on quarterly series)
+# =====================================
+
+def identify_peak_to_trough_episodes(dates, equity_curve, threshold=0.15):
+    """
+    Identify peak-to-trough drawdown episodes using the same frequency
+    as the backtest (quarterly). Episodes trigger once drawdown <= -threshold
+    and end when a new high is reached (drawdown returns to 0).
+    """
+    curve = np.asarray(equity_curve, dtype=float)
+    running_max = np.maximum.accumulate(curve)
+    dd = curve / running_max - 1.0
+
+    episodes = []
+    in_episode = False
+    peak_idx = None
+    trough_idx = None
+    min_dd = None
+
+    for i in range(len(curve)):
+        if not in_episode:
+            if dd[i] <= -threshold:
+                # peak is the last index where we hit the running max for this level
+                peak_candidates = np.where(curve[: i + 1] == running_max[i])[0]
+                peak_idx = int(peak_candidates[-1]) if len(peak_candidates) else 0
+                trough_idx = i
+                min_dd = float(dd[i])
+                in_episode = True
+        else:
+            if float(dd[i]) < min_dd:
+                min_dd = float(dd[i])
+                trough_idx = i
+
+            # episode ends once we recover to a new high (dd back to ~0)
+            if dd[i] >= -1e-12:
+                episodes.append(
+                    {
+                        "Peak": pd.to_datetime(dates[peak_idx]),
+                        "Trough": pd.to_datetime(dates[trough_idx]),
+                        "Depth": float(min_dd),
+                        "PeakIdx": int(peak_idx),
+                        "TroughIdx": int(trough_idx),
+                    }
+                )
+                in_episode = False
+                peak_idx = None
+                trough_idx = None
+                min_dd = None
+
+    # If we end the sample mid-episode, still record the peak-to-current-trough
+    if in_episode and peak_idx is not None and trough_idx is not None:
+        episodes.append(
+            {
+                "Peak": pd.to_datetime(dates[peak_idx]),
+                "Trough": pd.to_datetime(dates[trough_idx]),
+                "Depth": float(min_dd),
+                "PeakIdx": int(peak_idx),
+                "TroughIdx": int(trough_idx),
+            }
+        )
+
+    return episodes
+
+
+# Build quarterly equity curves (starting at 1.0) for each strategy
+equity_q = pd.DataFrame(
+    {
+        "Start": df["Start"],
+        "SPY": (1.0 + df["SPY"]).cumprod(),
+        "SPY+Put": (1.0 + df["SPY+Put"]).cumprod(),
+        "SPY+Collar": (1.0 + df["SPY+Collar"]).cumprod(),
+        "SPY+Collar+ZeroNet": (1.0 + df["SPY+Collar+ZeroNet"]).cumprod(),
+    }
+).set_index("Start")
+
+# Identify crises on the benchmark SPY curve so they match your drawdown plot frequency
+episodes = identify_peak_to_trough_episodes(
+    dates=equity_q.index.values,
+    equity_curve=equity_q["SPY"].values,
+    threshold=0.15,  # 15% peak-to-trough threshold
+)
+
+crisis_rows = []
+
+for j, ep in enumerate(episodes, start=1):
+    peak_dt = ep["Peak"]
+    trough_dt = ep["Trough"]
+    crisis_name = f"DD{j}_{peak_dt.date()}_{trough_dt.date()}"
+
+    sub = df.loc[(df["Start"] >= peak_dt) & (df["Start"] <= trough_dt)]
+    if sub.empty:
+        continue
+
+    for col, strat_name in [
+        ("SPY", "SPY"),
+        ("SPY+Put", "SPY+Put"),
+        ("SPY+Collar", "SPY+Collar"),
+        ("SPY+Collar+ZeroNet", "SPY+Collar+ZeroNet"),
+    ]:
+        rets = sub[col].values
+        cum_ret = float(np.prod(1.0 + rets) - 1.0)
+
+        curve = np.cumprod(1.0 + rets)
+        peak = np.maximum.accumulate(curve)
+        dd = (curve - peak) / peak
+        max_dd = float(dd.min())
+
+        crisis_rows.append(
+            {
+                "Crisis": crisis_name,
+                "Peak": peak_dt,
+                "Trough": trough_dt,
+                "Depth_SPY": ep["Depth"],
+                "Strategy": strat_name,
+                "CumRet": cum_ret,
+                "MaxDD": max_dd,
+                "N_Quarters": len(sub),
+            }
+        )
+
+crisis_stats_df = pd.DataFrame(crisis_rows)
+
+# =====================================
+# WORST / BEST QUARTERS (by SPY leg)
+# =====================================
+
+worst = df.nsmallest(5, "SPY")
+best  = df.nlargest(5, "SPY")
+
+# =====================================
+# PLOTS (saved as PNG)
+# =====================================
+
+# Equity curves: compound quarterly wealth (first point = wealth after first quarter; no synthetic anchor)
+equity = df.set_index("Start")[
+    ["SPY_Cum", "SPY+Put_Cum", "SPY+Collar_Cum", "SPY+Collar+ZeroNet_Cum"]
+]
+plt.figure(figsize=(10, 6))
+for col in equity.columns:
+    plt.plot(equity.index, equity[col], label=col)
+plt.title("Cumulative wealth (normalised; 1.0 = initial capital per strategy)")
+plt.xlabel("Date")
+plt.ylabel("Cumulative wealth (multiple of initial)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("equity_curves.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Drawdown curves
+plt.figure(figsize=(10, 6))
+for col in ["SPY", "SPY+Put", "SPY+Collar", "SPY+Collar+ZeroNet"]:
+    curve = (1.0 + df[col]).cumprod()
+    peak = np.maximum.accumulate(curve)
+    dd = (curve / peak) - 1.0
+    plt.plot(df["Start"], dd, label=col)
+plt.title("Quarterly Drawdowns")
+plt.xlabel("Date")
+plt.ylabel("Drawdown")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("drawdowns.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Boxplot of quarterly returns
+plt.figure(figsize=(8, 6))
+plt.boxplot(
+    [
+        df["SPY"].dropna(),
+        df["SPY+Put"].dropna(),
+        df["SPY+Collar"].dropna(),
+        df["SPY+Collar+ZeroNet"].dropna(),
+    ],
+    labels=["SPY", "SPY+Put", "SPY+Collar", "SPY+Collar+ZeroNet"],
+)
+plt.title("Distribution of Quarterly Returns")
+plt.ylabel("Quarterly Return")
+plt.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.savefig("quarterly_returns_boxplot.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# --- Zero-net collar diagnostics (4th strategy) ---
+fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+ax_net = axes[0]
+ax_net.axhline(0, color="gray", linestyle="--", linewidth=1)
+ax_net.bar(
+    zn_analysis_df["Start"],
+    zn_analysis_df["ZN_net_premium_pre_comm_USD"],
+    width=50,
+    color=np.where(
+        zn_analysis_df["ZN_net_premium_pre_comm_USD"].abs() < 10.0,
+        "seagreen",
+        "steelblue",
+    ),
+    edgecolor="white",
+    linewidth=0.3,
+    label="Put Ask $ − Call Bid $ (per contract)",
+)
+ax_net.set_ylabel("USD / contract")
+ax_net.set_title(
+    "Zero-net rule: NBBO net premium before commission (min. |net| over call strikes)"
+)
+ax_net.legend(loc="upper right", fontsize=8)
+ax_net.grid(True, axis="y", alpha=0.3)
+
+ax_mny = axes[1]
+ax_mny.plot(
+    zn_analysis_df["Start"],
+    zn_analysis_df["Static_collar_call_moneyness"],
+    "o-",
+    label="Static collar call K/S",
+    alpha=0.8,
+)
+ax_mny.plot(
+    zn_analysis_df["Start"],
+    zn_analysis_df["ZN_call_moneyness"],
+    "s-",
+    label="Zero-net collar call K/S",
+    alpha=0.8,
+)
+ax_mny.set_xlabel("Date")
+ax_mny.set_ylabel("Call moneyness (K / S₀)")
+ax_mny.set_title("Short call strike: static vs zero-net selection")
+ax_mny.legend(loc="best", fontsize=8)
+ax_mny.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("zero_net_collar_diagnostics.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+ratio_zn_collar = df["SPY+Collar+ZeroNet_Cum"] / df["SPY+Collar_Cum"]
+plt.figure(figsize=(10, 5))
+plt.plot(df["Start"], ratio_zn_collar, color="darkgreen", linewidth=2, label="Collar+ZeroNet / Collar")
+plt.axhline(1.0, color="gray", linestyle="--", linewidth=1, label="Parity")
+plt.title("Cumulative wealth ratio: zero-net collar vs static collar")
+plt.xlabel("Date")
+plt.ylabel("Wealth ratio (normalised)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("collar_zeronet_vs_static_wealth_ratio.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+excess_zn = df["SPY+Collar+ZeroNet"] - df["SPY+Collar"]
+tighter_call = (
+    zn_analysis_df["ZN_call_moneyness"]
+    < zn_analysis_df["Static_collar_call_moneyness"] - 1e-6
+)
+colors = np.where(tighter_call, "darkorange", "steelblue")
+plt.figure(figsize=(10, 5))
+plt.bar(df["Start"], excess_zn * 100.0, width=50, color=colors, edgecolor="white", linewidth=0.3)
+plt.axhline(0, color="black", linewidth=0.8)
+plt.ylabel("Quarterly return difference (pp)")
+plt.xlabel("Date")
+plt.title(
+    "SPY+Collar+ZeroNet minus SPY+Collar (per quarter); orange = lower short-call strike"
+)
+plt.legend(
+    handles=[
+        Patch(facecolor="steelblue", label="Zero-net call ≥ static call (K/S)"),
+        Patch(facecolor="darkorange", label="Zero-net call < static (tighter cap)"),
+    ],
+    loc="upper right",
+)
+plt.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.savefig("quarterly_excess_zeronet_minus_collar.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# =====================================
+# ALLOCATION: SPY vs DERIVATIVES
+# =====================================
+
+alloc_df = pd.DataFrame({
+    "Start": dates,
+    "Equity_Pct": alloc_equity_pct,
+    "Put_Cost_Pct": alloc_put_pct,
+    "Collar_Net_Pct": alloc_collar_net_pct,
+})
+
+# =====================================
+# OPTION CARRY / MONETARY EFFECT
+# =====================================
+
+# Per-quarter option cash flows (monetary terms)
+# collar_net = put_cost - call_premium: positive = we pay net, negative = we receive net
+put_cost_usd = [p * INITIAL_CAPITAL for p in alloc_put_pct]
+collar_net_usd = [c * INITIAL_CAPITAL for c in alloc_collar_net_pct]
+call_premium_usd = [put_cost_usd[i] - collar_net_usd[i] for i in range(len(dates))]
+
+option_carry_df = pd.DataFrame({
+    "Start": dates,
+    "Put_Cost_USD": put_cost_usd,
+    "Call_Premium_USD": call_premium_usd,
+    "Collar_Net_USD": collar_net_usd,
+    "Cum_Put_Cost_USD": np.cumsum(put_cost_usd),
+    "Cum_Collar_Net_USD": np.cumsum(collar_net_usd),
+})
+
+# Sanity check: collar net = put - call. Positive = we pay net (typical). Negative = we receive.
+n_paid_net = sum(1 for c in collar_net_usd if c > 0)
+n_received_net = sum(1 for c in collar_net_usd if c < 0)
+print(f"\nOption carry: {n_paid_net} quarters paid net (put>call), {n_received_net} quarters received net (call>put)")
+
+# Graph: option carry per quarter (put cost vs call premium vs net)
+fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+# Top: per-quarter cash flows (put paid vs call received)
+ax1 = axes[0]
+x = np.arange(len(dates))
+w = 0.35
+ax1.bar(x - w/2, put_cost_usd, width=w, label="Put premium paid", color="coral", alpha=0.8)
+ax1.bar(x + w/2, call_premium_usd, width=w, label="Call premium received", color="seagreen", alpha=0.8)
+ax1.axhline(0, color="gray", linewidth=0.5)
+ax1.set_ylabel("USD per quarter")
+ax1.set_title("Option Carry: Put Premium Paid vs Call Premium Received (per quarter)")
+ax1.legend(loc="upper right")
+ax1.grid(True, axis="y", alpha=0.3)
+ax1.set_xticks(x)
+ax1.set_xticklabels([d.strftime("%Y-%m") for d in dates], rotation=45, ha="right")
+
+# Bottom: cumulative put cost and cumulative collar net (put - call)
+# Positive cum. collar net = we paid net over time; negative = we received net
+ax2 = axes[1]
+ax2.plot(x, option_carry_df["Cum_Put_Cost_USD"], "o-", color="coral", label="Cum. put cost (SPY+Put)")
+ax2.plot(x, option_carry_df["Cum_Collar_Net_USD"], "s-", color="seagreen", label="Cum. static collar net")
+ax2.plot(
+    x,
+    zn_analysis_df["Cum_Collar_ZeroNet_Net_USD"],
+    "^-",
+    color="darkgreen",
+    alpha=0.85,
+    label="Cum. zero-net collar net (see ZeroNet_Analysis sheet)",
+)
+ax2.axhline(0, color="gray", linewidth=0.5)
+ax2.set_ylabel("USD (cumulative)")
+ax2.set_xlabel("Quarter")
+ax2.set_title("Cumulative Option Carry Effect")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+ax2.set_xticks(x)
+ax2.set_xticklabels([d.strftime("%Y-%m") for d in dates], rotation=45, ha="right")
+
+plt.tight_layout()
+plt.savefig("option_carry.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Combined graph: average allocation per strategy
+fig, ax = plt.subplots(figsize=(9, 5))
+strategies = ["SPY", "SPY+Put", "SPY+Collar", "SPY+Collar+ZeroNet"]
+equity_avg = [np.mean(alloc_equity_pct)] * 4
+deriv_avg = [
+    0.0,
+    np.mean(alloc_put_pct),
+    np.mean(alloc_collar_net_pct),
+    np.mean(alloc_collar_zn_net_pct),
+]
+
+x = np.arange(len(strategies))
+w = 0.35
+bars1 = ax.bar(x - w/2, equity_avg, w, label="SPY (equity)", color="steelblue")
+bars2 = ax.bar(x + w/2, deriv_avg, w, label="Derivatives (net cost)", color="coral")
+ax.set_ylabel("% of Initial Capital")
+ax.set_title("Average Portfolio Allocation: SPY vs Derivatives")
+ax.set_xticks(x)
+ax.set_xticklabels(strategies)
+ax.legend()
+ymin = min(0, min(deriv_avg)) - 0.02
+ax.set_ylim(ymin, 1.05)
+plt.tight_layout()
+plt.savefig("allocation_spy_vs_derivatives.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# =====================================
+# PAYOFF TABLE (derivatives at expiry)
+# =====================================
+
+# Illustrative: S = terminal SPY, K_put = 92.5%, K_call = 107.5% of initial spot
+S0 = 400  # illustrative spot
+K_put = S0 * 0.925
+K_call = S0 * 1.075
+
+S_levels = [0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15]
+payoff_rows = []
+for m in S_levels:
+    S = S0 * m
+    put_payoff = max(K_put - S, 0)
+    call_payoff_short = -max(S - K_call, 0)
+    payoff_rows.append({
+        "Moneyness_S": m,
+        "S": S,
+        "Put_Payoff": put_payoff,
+        "Short_Call_Payoff": call_payoff_short,
+        "Collar_Net_Payoff": put_payoff + call_payoff_short,
+    })
+
+payoff_table_df = pd.DataFrame(payoff_rows)
+
+# =====================================
+# PAYOFF DIAGRAMS (dissertation figures)
+# =====================================
+
+def payoff_protective_put():
+    """Payoff at expiry: Long SPY + Long Put (K_put = 92.5%)"""
+    S = np.linspace(S0 * 0.7, S0 * 1.2, 200)
+    equity = S
+    put_payoff = np.maximum(K_put - S, 0)
+    total = equity + put_payoff
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(S, equity, "k--", alpha=0.5, label="Long SPY")
+    ax.plot(S, put_payoff, "b--", alpha=0.5, label="Long Put")
+    ax.plot(S, total, "b-", lw=2, label="Protective Put (combined)")
+    ax.axvline(K_put, color="gray", linestyle=":", alpha=0.7)
+    ax.set_xlabel("SPY at Expiry (S)")
+    ax.set_ylabel("Payoff")
+    ax.set_title("Protective Put: Long SPY + Long OTM Put")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(S0 * 0.7, S0 * 1.2)
+    plt.tight_layout()
+    plt.savefig("payoff_protective_put.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+def payoff_collar():
+    """Payoff at expiry: Long SPY + Long Put + Short Call"""
+    S = np.linspace(S0 * 0.7, S0 * 1.2, 200)
+    equity = S
+    put_payoff = np.maximum(K_put - S, 0)
+    call_payoff = -np.maximum(S - K_call, 0)
+    total = equity + put_payoff + call_payoff
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(S, equity, "k--", alpha=0.5, label="Long SPY")
+    ax.plot(S, put_payoff, "b--", alpha=0.5, label="Long Put")
+    ax.plot(S, call_payoff, "r--", alpha=0.5, label="Short Call")
+    ax.plot(S, total, "g-", lw=2, label="Collar (combined)")
+    ax.axvline(K_put, color="gray", linestyle=":", alpha=0.7)
+    ax.axvline(K_call, color="gray", linestyle=":", alpha=0.7)
+    ax.set_xlabel("SPY at Expiry (S)")
+    ax.set_ylabel("Payoff")
+    ax.set_title("Collar: Long SPY + Long Put + Short Call")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(S0 * 0.7, S0 * 1.2)
+    plt.tight_layout()
+    plt.savefig("payoff_collar.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+payoff_protective_put()
+payoff_collar()
+
+# =====================================
+# GREEKS: Delta (Black-Scholes)
+# =====================================
+
+def bs_delta_put(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return norm.cdf(d1) - 1
+
+def bs_delta_call(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return norm.cdf(d1)
+
+# Delta vs moneyness (S/S0) for put and call, T=0.25, r=0.04, sigma=0.2
+S_vals = np.linspace(S0 * 0.8, S0 * 1.2, 100)
+T, r, sigma = 0.25, 0.04, 0.20
+delta_put = [bs_delta_put(s, K_put, T, r, sigma) for s in S_vals]
+delta_call = [bs_delta_call(s, K_call, T, r, sigma) for s in S_vals]
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.plot(S_vals / S0, delta_put, "b-", lw=2, label="Put Delta (K=92.5%)")
+ax.plot(S_vals / S0, delta_call, "r-", lw=2, label="Call Delta (K=107.5%)")
+ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
+ax.axvline(1.0, color="gray", linestyle=":", alpha=0.5)
+ax.set_xlabel("Moneyness (S / S₀)")
+ax.set_ylabel("Delta")
+ax.set_title("Option Delta vs Spot (Black-Scholes, T=3 months)")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("greek_delta.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# =====================================
+# EXPORT
+# =====================================
+
+zn_config_df = pd.DataFrame(
+    {
+        "Parameter": [
+            "Short-call moneyness search (K/S)",
+            "Strike objective",
+            "Execution (cash at entry)",
+            "ZN_net_premium_pre_comm_USD",
+            "ZN_net_incl_comm_USD",
+            "Put leg",
+            "Commission (per contract, round-trip at entry)",
+        ],
+        "Value": [
+            f"{ZERO_CALL_MNY_MIN:g}–{ZERO_CALL_MNY_MAX:g}",
+            "Minimise |Put Ask×100 − Call Bid×100| on same expiry",
+            "Long put @ Ask; short call @ Bid",
+            "Put Ask − Call Bid for chosen short call (per contract)",
+            "Above + OPTION_COMMISSION_PER_CONTRACT",
+            "Same as static strategies (~92.5% moneyness band)",
+            OPTION_COMMISSION_PER_CONTRACT,
+        ],
+    }
+)
+
+
+def _add_zero_net_excel_charts(workbook):
+    """Embed line charts on ZeroNet_Analysis sheet (requires openpyxl)."""
+    try:
+        from openpyxl.chart import LineChart, Reference
+    except ImportError:
+        print("Note: openpyxl charts skipped (install openpyxl for Excel graphs).")
+        return
+
+    if "ZeroNet_Analysis" not in workbook.sheetnames:
+        return
+    ws = workbook["ZeroNet_Analysis"]
+    max_row = ws.max_row
+    if max_row < 2:
+        return
+
+    cats = Reference(ws, min_col=1, min_row=2, max_row=max_row)
+
+    ch_net = LineChart()
+    ch_net.title = "Zero-net: premium net pre-comm vs incl. comm (USD/contract)"
+    ch_net.y_axis.title = "USD"
+    ch_net.x_axis.title = "Roll date"
+    ch_net.width = 20
+    ch_net.height = 9
+    data_net = Reference(ws, min_col=2, min_row=1, max_col=3, max_row=max_row)
+    ch_net.add_data(data_net, titles_from_data=True)
+    ch_net.set_categories(cats)
+    ws.add_chart(ch_net, "H2")
+
+    ch_mny = LineChart()
+    ch_mny.title = "Short call moneyness: static vs zero-net"
+    ch_mny.y_axis.title = "K / S₀"
+    ch_mny.width = 20
+    ch_mny.height = 9
+    data_mny = Reference(ws, min_col=4, min_row=1, max_col=5, max_row=max_row)
+    ch_mny.add_data(data_mny, titles_from_data=True)
+    ch_mny.set_categories(cats)
+    ws.add_chart(ch_mny, "H22")
+
+
+with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+    df.to_excel(writer, sheet_name="Quarterly_Returns", index=False)
+    stats.to_excel(writer, sheet_name="Performance")
+    dist_stats_df.to_excel(writer, sheet_name="Distribution_Stats", index=False)
+    regime_stats_df.to_excel(writer, sheet_name="Regime_Performance", index=False)
+    crisis_stats_df.to_excel(writer, sheet_name="Crisis_Windows", index=False)
+    alloc_df.to_excel(writer, sheet_name="Allocation_SPY_vs_Deriv", index=False)
+    option_carry_df.to_excel(writer, sheet_name="Option_Carry", index=False)
+    payoff_table_df.to_excel(writer, sheet_name="Derivative_Payoffs", index=False)
+    worst.to_excel(writer, sheet_name="Worst_SPY_Quarters", index=False)
+    best.to_excel(writer, sheet_name="Best_SPY_Quarters", index=False)
+    zn_analysis_df.to_excel(writer, sheet_name="ZeroNet_Analysis", index=False)
+    zn_config_df.to_excel(writer, sheet_name="ZeroNet_Config", index=False)
+
+    _add_zero_net_excel_charts(writer.book)
+
+print("\nBacktest complete.")
+print(stats)
+print("\nTrades executed:", len(df))
+print("First backtest date:", df["Start"].min())
+print("Last  backtest date:", df["Start"].max())
